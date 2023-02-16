@@ -1,0 +1,244 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/multiformats/go-multiaddr"
+
+	// dht "github.com/libp2p/go-libp2p-kad-dht"
+	// pubsub "github.com/libp2p/go-libp2p-pubsub"
+	ipfs "github.com/ipfs/go-ipfs-api"
+)
+
+var (
+	chost host.Host
+)
+
+const (
+	topicCirrus = "cirrus-hash-sharing"
+)
+
+func handleStream(stream network.Stream) {
+	fmt.Println("Got a new stream!")
+
+	// Create a buffer stream for non blocking read and write.
+	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+	go readData(rw)
+	go writeData(rw)
+
+	// 'stream' will stay open until you close it (or the other side closes it).
+}
+
+func readData(rw *bufio.ReadWriter) {
+	for {
+		str, err := rw.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from buffer")
+			panic(err)
+		}
+
+		if str == "" {
+			return
+		}
+		if str != "\n" {
+			// Green console colour: 	\x1b[32m
+			// Reset console colour: 	\x1b[0m
+			fmt.Printf("\x1b[32m%s\x1b[0m> ", str)
+		}
+
+	}
+}
+
+func writeData(rw *bufio.ReadWriter) {
+	stdReader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Print("> ")
+		sendData, err := stdReader.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from stdin")
+			panic(err)
+		}
+
+		_, err = rw.WriteString(fmt.Sprintf("%s\n", sendData))
+		if err != nil {
+			fmt.Println("Error writing to buffer")
+			panic(err)
+		}
+		err = rw.Flush()
+		if err != nil {
+			fmt.Println("Error flushing buffer")
+			panic(err)
+		}
+	}
+}
+
+func checkNodeStatus(nodeUrl string) error {
+	resp, err := http.Post(nodeUrl+"/api/v0/id", "", io.MultiReader())
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Node at %s is not accessible", nodeUrl)
+	}
+
+	return nil
+}
+
+func main() {
+	help := flag.Bool("help", false, "Display Help")
+	init := flag.Bool("init", false, "Will create a new pairof Keys")
+	cfg := parseFlags()
+
+	if *help {
+		fmt.Printf("Simple example for peer discovery using mDNS. mDNS is great when you have multiple peers in local LAN.")
+		fmt.Printf("Usage: \n   Run './chat-with-mdns'\nor Run './chat-with-mdns -host [host] -port [port] -rendezvous [string] -pid [proto ID]'\n")
+		generateRSAKey()
+		os.Exit(0)
+	} else if *init {
+		generateRSAKey()
+	}
+
+	_, errw := os.Stat("private.pem")
+	if os.IsNotExist(errw) {
+		fmt.Println("Please create new Pair of RSA keys. \n ./cirrus-cli --init")
+		os.Exit(0)
+	}
+
+	err := checkNodeStatus("http://127.0.0.1:5001")
+
+	if err != nil {
+		fmt.Println("Node is not live")
+	}
+
+	fmt.Println("Node is accessible")
+	shell := ipfs.NewShell("http://127.0.0.1:5001")
+	node, err := shell.ID()
+
+	if err != nil {
+		fmt.Println("Sry Node Hash not set")
+		return
+	}
+	fmt.Println("\n***************************This is the IPFS node INfo:*************************")
+	for _, addr := range node.Addresses {
+		fmt.Println(addr)
+	}
+
+	fmt.Printf("[*] Listening on: %s with port: %d\n", cfg.listenHost, cfg.listenPort)
+
+	ctx := context.Background()
+	// r := rand.Reader
+	rsaKey := getRSAPrivKey()
+
+	if rsaKey == nil {
+		fmt.Println("Something is wrong with Keys. Please generate New Keys \n ./cirrus-cli --init")
+	}
+
+	fmt.Println(crypto.RSA)
+	// Creates a new RSA key pair for this host.
+	// identity, err := libp2p.Identity(privateKey)
+	// privateKeyLibp2p, _ := crypto.UnmarshalRsaPrivateKey(rsaKey)
+	if err != nil {
+		panic(err)
+	}
+
+	// 0.0.0.0 will listen on any interface device.
+	//sourceMultiAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", cfg.listenHost, cfg.listenPort))
+
+	// libp2p.New constructs a new libp2p Host.
+	// Other options can be added here.
+	sourceMultiAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", cfg.listenHost, cfg.listenPort))
+	chost, err := libp2p.New(
+		libp2p.Identity(rsaKey),
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", 6000)),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	ps, err := pubsub.NewFloodSub(context.Background(), chost)
+	if err != nil {
+		panic(err)
+	}
+
+	sub, err := ps.Subscribe(topicCirrus)
+	if err != nil {
+		panic(err)
+	}
+
+	// Set a function as stream handler.
+	// This function is called when a peer initiates a connection and starts a stream with this peer.
+	chost.SetStreamHandler(protocol.ID(cfg.ProtocolID), handleStream)
+
+	fmt.Printf("\n[*] Your Multiaddress Is: /ip4/%s/tcp/%v/p2p/%s\n", cfg.listenHost, cfg.listenPort, chost.ID().Pretty())
+	errs := HttpAPIServer()
+
+	if errs != nil {
+		fmt.Println("Something went wrong")
+		return
+	}
+
+	peerChan := initMDNS(chost, cfg.RendezvousString)
+
+	for { // allows multiple peers to join
+		peer := <-peerChan // will block untill we discover a peer
+		fmt.Println("Found peer:", peer, ", connecting")
+
+		if err := chost.Connect(ctx, peer); err != nil {
+			fmt.Println("Connection failed:", err)
+			continue
+		}
+
+		// open a stream, this stream will be handled by handleStream other end
+		stream, err := chost.NewStream(ctx, peer.ID, protocol.ID(cfg.ProtocolID))
+
+		if err != nil {
+			fmt.Println("Stream open failed", err)
+		} else {
+			rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+			go writeData(rw)
+			go readData(rw)
+			fmt.Println("Connected to:", peer)
+		}
+
+		msg, err := sub.Next(context.Background())
+		if err != nil {
+			fmt.Println("Error:", err)
+			break
+		}
+		fmt.Println("IPFS-HASH:", string(msg.Data))
+	}
+}
+
+// func subs() {
+// 	ps, err := pubsub.NewFloodSub(context.Background(), chost)
+// 	// Subscribe to a topic
+// 	sub, err := ps.Subscribe(topicCirrus)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	fmt.Println(sub.Topic())
+// }
+
+func pubs(hash string) {
+	ps, err := pubsub.NewFloodSub(context.Background(), chost)
+	err = ps.Publish(topicCirrus, []byte(hash))
+	if err != nil {
+		panic(err)
+	}
+}
